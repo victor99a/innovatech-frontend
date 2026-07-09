@@ -1,0 +1,157 @@
+name: CI/CD Frontend - ECS Fargate
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION:      ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY:  innovatech-frontend
+  ECS_CLUSTER:     innovatech-cluster
+  ECS_SERVICE:     frontend-service
+  TASK_FAMILY:     innovatech-frontend
+  TARGET_GROUP:    tg-frontend
+  ALB_NAME:        innovatech-alb
+  CONTAINER_NAME:  frontend
+  CONTAINER_PORT:  80
+
+jobs:
+  # =====================================================================
+  # ETAPA 1 - BUILD + LINT (gate de calidad)
+  # =====================================================================
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Lint (bloquea el pipeline si hay errores)
+        run: npm run lint
+
+      - name: Build de produccion (verifica que compila)
+        run: npm run build
+
+  # =====================================================================
+  # ETAPA 2 - PACKAGE + PUSH a ECR + DEPLOY a ECS Fargate
+  # =====================================================================
+  deploy:
+    needs: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (GitHub Secrets)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login a Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Crear repositorio ECR si no existe
+        run: |
+          aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" 2>/dev/null || \
+          aws ecr create-repository --repository-name "$ECR_REPOSITORY" \
+            --image-scanning-configuration scanOnPush=true --image-tag-mutability MUTABLE
+
+      - name: Build, tag (SHA + latest) y push
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE_TAG=${GITHUB_SHA::7}
+          IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY
+          docker build -t $IMAGE_URI:$IMAGE_TAG -t $IMAGE_URI:latest .
+          docker push $IMAGE_URI:$IMAGE_TAG
+          docker push $IMAGE_URI:latest
+          echo "image=$IMAGE_URI:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Registrar Task Definition
+        env:
+          IMAGE: ${{ steps.build.outputs.image }}
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          cat > /tmp/td.json <<JSON
+          {
+            "family": "${TASK_FAMILY}",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "256",
+            "memory": "512",
+            "executionRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/LabRole",
+            "taskRoleArn": "arn:aws:iam::${ACCOUNT_ID}:role/LabRole",
+            "containerDefinitions": [{
+              "name": "${CONTAINER_NAME}",
+              "image": "${IMAGE}",
+              "essential": true,
+              "portMappings": [{"containerPort": ${CONTAINER_PORT}, "protocol": "tcp"}],
+              "environment": [
+                {"name": "VENTAS_UPSTREAM", "value": "http://${{ secrets.ALB_DNS }}"},
+                {"name": "DESPACHOS_UPSTREAM", "value": "http://${{ secrets.ALB_DNS }}"}
+              ],
+              "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                  "awslogs-group": "/ecs/${TASK_FAMILY}",
+                  "awslogs-region": "${AWS_REGION}",
+                  "awslogs-stream-prefix": "ecs",
+                  "awslogs-create-group": "true"
+                }
+              }
+            }]
+          }
+          JSON
+          aws ecs register-task-definition --cli-input-json file:///tmp/td.json
+
+      - name: Asegurar Target Group y regla ALB (default)
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query 'Vpcs[0].VpcId' --output text)
+          TG_ARN=$(aws elbv2 describe-target-groups --names "$TARGET_GROUP" --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "")
+          if [ -z "$TG_ARN" ] || [ "$TG_ARN" = "None" ]; then
+            TG_ARN=$(aws elbv2 create-target-group --name "$TARGET_GROUP" \
+              --protocol HTTP --port $CONTAINER_PORT --vpc-id $VPC_ID --target-type ip \
+              --health-check-protocol HTTP --health-check-path / \
+              --matcher HttpCode=200 \
+              --query 'TargetGroups[0].TargetGroupArn' --output text)
+          fi
+          echo "TG_ARN=$TG_ARN" >> "$GITHUB_ENV"
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names "$ALB_NAME" --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+          LISTENER_ARN=$(aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN --query 'Listeners[?Port==`80`].ListenerArn' --output text)
+          # El frontend es la accion DEFAULT del listener (todo lo que no matchea /api/*)
+          aws elbv2 modify-listener --listener-arn $LISTENER_ARN \
+            --default-actions "[{\"Type\":\"forward\",\"TargetGroupArn\":\"$TG_ARN\"}]"
+
+      - name: Crear/actualizar servicio ECS
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query 'Vpcs[0].VpcId' --output text)
+          SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[*].SubnetId' --output text | tr '\t' ',')
+          SG_ID=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=innovatech-ecs-sg" --query 'SecurityGroups[0].GroupId' --output text)
+          STATUS=$(aws ecs describe-services --cluster $ECS_CLUSTER --services $ECS_SERVICE --query 'services[0].status' --output text 2>/dev/null || echo "NONE")
+          if [ "$STATUS" = "ACTIVE" ]; then
+            aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE \
+              --task-definition $TASK_FAMILY --force-new-deployment
+          else
+            aws ecs create-service --cluster $ECS_CLUSTER --service-name $ECS_SERVICE \
+              --task-definition $TASK_FAMILY --desired-count 2 --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" \
+              --load-balancers "targetGroupArn=$TG_ARN,containerName=$CONTAINER_NAME,containerPort=$CONTAINER_PORT" \
+              --health-check-grace-period-seconds 60
+          fi
+
+      - name: Esperar despliegue estable
+        run: aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE
